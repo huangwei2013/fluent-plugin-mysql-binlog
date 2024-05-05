@@ -1,0 +1,7 @@
+PyMySQL==1.1.0
+wheel==0.29.0
+mysql-replication==0.45.1
+colorlog==5.0.1
+chardet==3.0.4
+cryptography==36.0.1
+rich==12.2.0
