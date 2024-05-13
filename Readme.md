@@ -63,9 +63,9 @@ sudo docker run -it --name=fluentBinlogSync  \
   database MYSQL实例要同步的DB名。可选。默认为空。
   table MYSQL实例要同步的表名,多张表用空格隔开，如-t tbl1 tbl2。可选。默认为空
   tag mysql_binlog
-  interval 10
+  interval 30
   only_dml true
-  buffer_file_path /var/log/fluentd/mysql_binlog.in.buffer
+  buffer_file_path /var/log/fluentd/mysql.binlog.in.buffer
 </source>
 
 
@@ -83,7 +83,7 @@ sudo docker run -it --name=fluentBinlogSync  \
     port MYSQL实例的端口
     username MYSQL实例的访问用户名
     password MYSQL实例的访问密码(日志打印会将该字段做脱敏)
-    buffer_file_path /var/log/fluentd/mysql_binlog.out.buffer
+    buffer_file_path /var/log/fluentd/mysql.binlog.out.buffer
  </store>
 </match>
 

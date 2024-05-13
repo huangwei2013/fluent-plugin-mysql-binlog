@@ -20,12 +20,22 @@ module Fluent::Plugin
 
     def initialize
       super
+
+      @binlog_files = {}
+      @binlog_files_update_flag = false
+
+	  @mutex_binlog_list = Mutex.new
+
+      @mutex_binlog_sync = Mutex.new
+      @mysql_sync_safe_flag = nil
     end
 
     def configure(conf)
       super
-      @binlog_files = {}
-      @binlog_files_update_flag = false
+
+      if @interval == 0
+        @interval = 30
+      end
     end
 
    def start
@@ -34,27 +44,12 @@ module Fluent::Plugin
       load_binlog_offsets_from_buffer_file
 
       @threads = {}
-      fetch_start_files.each do |log_file, offset|
 
-        if @binlog_files[log_file].nil?
-            offset = 0
-            @binlog_files[log_file] = offset
-        else
-            offset = @binlog_files[log_file]
-        end
-
-        puts "run #{log_file} #{offset}"
-        @threads[log_file] = Thread.new do
-          begin
-            run("#{log_file}", "#{offset}")
-          rescue => e
-            $log.error "运行 run 方法时出错：#{e.message}"
-          end
-        end
-      end
-
-      @buffer_thread = Thread.new { run_buffer_thread }
+      @buffer_thread_1 = Thread.new { run_sync }
+      @buffer_thread_2 = Thread.new { run_sync_info_save }
+      @buffer_thread_3 = Thread.new { run_merge_binlog_files }
     end
+
 
     def shutdown
       super
@@ -65,40 +60,105 @@ module Fluent::Plugin
       write_binlog_offsets_to_buffer_file
     end
 
+
     private
 
-    def run_buffer_thread
+
+    def run_sync
+      sleep 1
       loop do
-        sleep 60 # 每分钟执行一次写入操作
+        @binlog_files.each do |log_file, v|
+          if @binlog_files[log_file]["sync_flag"] == 1
+            if @binlog_files[log_file]["thread_id"].nil? || (@binlog_files[log_file]["thread_id"] == 0)
+              @threads[log_file] = Thread.new do
+                begin
+                  run_binlog_sync(log_file)
+                rescue => e
+                  log.error "run_binlog_sync fail : #{e.message}"
+                end
+              end
+            end
+          end
+        end
+        sleep interval
+      end
+    end
+
+
+    def run_merge_binlog_files
+      loop do
+        merge_binlog_files
+        sleep 30
+      end
+    end
+
+
+    def run_sync_info_save
+      loop do
+        sleep 60 
         write_binlog_offsets_to_buffer_file
       end
     end
 
-    def write_binlog_offsets_to_buffer_file
 
-      if @binlog_files_update_flag
-        # 将多行 key=value 内容写入到 buffer 文件中
-        puts "binlog_files : #{@binlog_files}"
-        File.open(@buffer_file_path, 'w') do |file|
-          @binlog_files.each do |binlog_file, offset|
-            file.puts "#{binlog_file}=#{offset}"
+    def merge_binlog_files
+      current_timestamp = Time.now.to_i
+      fetch_sync_files.each do |log_file, offset_binlog|
+        if @binlog_files[log_file].nil?
+          offset_sync = 0
+          @binlog_files[log_file] = { "log_file"=>log_file, "offset_sync"=>0, "offset_binlog"=>offset_binlog, "sync_flag"=>1, "sync_time"=>current_timestamp }
+          log.info("new binlog file : #{log_file}")
+        else
+          offset_sync = @binlog_files[log_file]["offset_sync"]
+          @binlog_files[log_file]["sync_time"] = current_timestamp
+          @binlog_files[log_file]["offset_binlog"] = offset_binlog
+        end
+
+        if (offset_binlog > 0)
+          if offset_binlog > offset_sync
+            @binlog_files[log_file]["sync_flag"] = 1
+          else
+            @binlog_files[log_file]["sync_flag"] = 0
           end
+        end
+      end
+
+      @binlog_files.each do |log_file, v|
+        if @binlog_files[log_file]["sync_time"] != current_timestamp
+          @binlog_files[log_file]["sync_flag"] = 0
         end
       end
     end
 
-    def load_binlog_offsets_from_buffer_file
-      # 从 buffer 文件中读取先前同步的多行内容
-      # 每一行的格式为 key=value，其中 key 是 binlog 文件名，value 是已同步的 offset 值
-      File.foreach(@buffer_file_path ) do |line|
-        key, value = line.chomp.split('=')
-        @binlog_files[key] = value.to_i
-      end
 
+    def write_binlog_offsets_to_buffer_file
+      if @binlog_files_update_flag
+        if File.exist?(@buffer_file_path)
+          FileUtils.cp(@buffer_file_path, "#{@buffer_file_path}.bak")
+        end
+
+        File.open(@buffer_file_path, 'w') do |file|
+          @binlog_files.each do |binlog_file, valueInJson|
+            file.puts "#{binlog_file}=#{valueInJson["offset_sync"]}"
+          end
+        end
+        @binlog_files_update_flag = false
+      end
+    end
+
+
+    def load_binlog_offsets_from_buffer_file
+      begin
+        # each line: key=value
+        File.foreach(@buffer_file_path) do |line|
+          key, value = line.chomp.split('=')
+          @binlog_files[key] = { "log_file"=>key, "offset_sync"=>value.to_i, "offset_binlog"=>0, "sync_flag"=>0, "sync_time"=>0}
+        end
       rescue Errno::ENOENT
         log.warn "Buffer file '#{@buffer_file_path}' not found. Starting with empty offsets."
-      {}
+      end
     end
+
 
     def getRunCommand(log_file, offset)
       cur_run_path = File.dirname(__FILE__)
@@ -108,11 +168,9 @@ module Fluent::Plugin
       if !@database.nil? && !@database.empty?
           command += " -d #{@database} "
       end
-
       if !@table.nil? && !@table.empty?
           command += " -t #{@table} "
       end
-
       if @only_dml
           command += "  --only-dml "
       end
@@ -120,67 +178,120 @@ module Fluent::Plugin
       return  command
     end
 
-    def run(log_file, offset)
+
+    def safe_lock(mutex_value)
+      ret = nil 
+      if @mutex_binlog_sync.try_lock
+        begin
+          if @mysql_sync_safe_flag.nil?
+            @mysql_sync_safe_flag = mutex_value
+            ret = mutex_value     
+          elsif @mysql_sync_safe_flag == mutex_value
+            ret = mutex_value  
+          end
+        ensure
+          @mutex_binlog_sync.unlock
+        end
+      end
+      return ret
+    end
+
+
+  
+    def safe_unlock(mutex_value)
+      ret = nil 
+      if @mutex_binlog_sync.try_lock
+        begin
+          if @mysql_sync_safe_flag.nil?
+            ret = mutex_value    
+          elsif @mysql_sync_safe_flag == mutex_value
+            @mysql_sync_safe_flag = nil
+            ret = mutex_value   
+          end
+        ensure
+          @mutex_binlog_sync.unlock
+        end
+      end
+      return ret
+    end
+
+
+    def run_binlog_sync(log_file)
+      thread_id = Thread.current.object_id
+      @binlog_files[log_file]["thread_id"] = thread_id
+      offset_sync = @binlog_files[log_file]["offset_sync"]
+      offset_binlog = @binlog_files[log_file]["offset_binlog"]
+
+      log.info("[sync start] log_file:#{log_file}, offset_sync:#{offset_sync}, offset_binlog:#{offset_binlog}, thread_id:#{thread_id}")
 
       loop do
-
         if !@binlog_files[log_file].nil?
-            offset = @binlog_files[log_file]
+            offset_sync = @binlog_files[log_file]["offset_sync"]
         else
-            @binlog_files[log_file] = offset
+            @binlog_files[log_file]["offset_sync"] = offset_sync
         end
 
-        command = getRunCommand(log_file, offset)
-        stdout, stderr, status = Open3.capture3("#{command}") # 获取标准输出和标准错误
+        command = getRunCommand(log_file, offset_sync)
+        sync_counter = -1
 
-        # 检查命令是否成功执行
-        if !status.success?
-          puts "执行失败：#{status}"
+        begin
+          try_lock = safe_lock(thread_id)
+          if !try_lock.nil?
+            log.info(" thread : #{thread_id}, binlog : #{log_file}, run : #{command}")
+
+            sync_counter = 0
+            stdout = IO.popen("#{command}")
+            stdout.each_line do |line|
+              line_statement = line.chomp
+              parts = line_statement.split("; #start")
+              next if parts.length == 1
+
+              sql = parts[0]
+              offset_sync = parts[1].match(/end (\d+)/)[1].to_i
+
+              router.emit(@tag, Fluent::Engine.now, {'sql' => sql, 'binlog_file'=>log_file, 'offset' => offset_sync})
+              sync_counter += 1
+
+              if offset_sync > @binlog_files[log_file]["offset_sync"]
+                @binlog_files[log_file]["offset_sync"] = offset_sync
+                @binlog_files_update_flag = true
+              end
+            end
+          end
+        rescue => e
+          log.error("Error processing binlog #{log_file} : #{e.message}")
+        ensure
+          safe_unlock(thread_id)
         end
-        stdout.each_line do |line|
 
-          begin
-            line_statement = line.chomp
-            parts = line_statement.split("; #start")
-            next if parts.length == 1 # 如果没有匹配到，parts 长度应该为 1
-
-            sql = parts[0]
-            offset = parts[1].match(/end (\d+)/)[1].to_i
-
-            # 发送 SQL 语句到 Fluentd 流
-            router.emit(@tag, Fluent::Engine.now, {'sql' => sql, 'binlog_file'=>log_file, 'offset' => offset})
-         rescue => e
-           log.error("Error processing binlog line: #{e.message}")
-         end
-
-        end
-
-        # 有变化才更新
-        if offset > @binlog_files[log_file]
-          @binlog_files[log_file] = offset
+        if sync_counter == 0
+          @binlog_files[log_file]["offset_sync"] = offset_binlog
           @binlog_files_update_flag = true
+          @binlog_files[log_file]["sync_flag"] = 0
         end
 
-        sleep @interval  # 同步周期
+        if @binlog_files[log_file]["sync_flag"] == 1
+          sleep @interval
+        else
+          log.info("[run sync stop] log_file:#{log_file}, offset_sync:#{offset_sync}, offset_binlog:#{offset_binlog}, thread_id:#{thread_id}")
+          @binlog_files[log_file]["thread_id"] = 0
+          break
+        end
       end
     end
 
-    def fetch_start_files
+
+    def fetch_sync_files
+      cur_binlog_files = {}
       client = Mysql2::Client.new(host: @host, port: @port, username: @username, password: @password)
-
-      # 执行 SQL 查询获取 binlog 文件列表及对应的偏移量
       result = client.query("SHOW BINARY LOGS")
-
-      # 解析查询结果获取 binlog 文件列表及对应的偏移量
-      start_files = {}
       result.each do |row|
-        start_files[row['Log_name']] = 0
+        cur_binlog_files[row['Log_name']] = row['File_size']
       end
-
-      # 返回 binlog 文件列表及对应的偏移量
-      start_files
-    ensure
-      client.close if client
+      return cur_binlog_files
+      
+      ensure
+        client.close if client
+      end
     end
-  end
 end

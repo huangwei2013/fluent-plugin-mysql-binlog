@@ -59,7 +59,6 @@ module Fluent::Plugin
     end
 
     def write_binlog_offsets_to_buffer_file
-      puts "binlog_files : #{@binlog_files}"
       File.open(@buffer_file_path, 'w') do |file|
         @binlog_files.each do |binlog_file, offset|
           file.puts "#{binlog_file}=#{offset}"
